@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - run: >-
           docker run
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -78,7 +78,7 @@ jobs:
       GO_TEST_FLAGS: ${{ matrix.platform == 'macOS' && matrix.go < 24 && '-ldflags=-linkmode=external' || '' }}
     steps:
 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - uses: actions/setup-go@v6
       with:
@@ -114,7 +114,7 @@ jobs:
           unzip
           mingw-w64-x86_64-go
 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - uses: actions/cache@v4
       with:
