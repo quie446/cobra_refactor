@@ -1096,9 +1096,6 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 		preExecHookFn(c)
 	}
 
-	// initialize help at the last point to allow for user overriding
-	c.InitDefaultHelpCmd()
-
 	args := c.args
 
 	// Workaround FAIL with "go test -v" or "cobra.test -test.v", see #155
@@ -1106,11 +1103,11 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 		args = os.Args[1:]
 	}
 
-	// initialize the __complete command to be used for shell completion
-	c.initCompleteCmd(args)
-
-	// initialize the default completion command
-	c.InitDefaultCompletionCmd(args...)
+	// Explicitly assemble the built-in commands (help, __complete, completion).
+	// Kept as a single idempotent registration step so the command tree is not
+	// rebuilt or re-attached on repeated executions; users can also call
+	// InitDefaultCommands themselves to prepare a tree for testing.
+	c.InitDefaultCommands(args...)
 
 	// Now that all commands have been created, let's make sure all groups
 	// are properly created also
@@ -1266,51 +1263,83 @@ func (c *Command) InitDefaultHelpCmd() {
 	}
 
 	if c.helpCommand == nil {
-		c.helpCommand = &Command{
-			Use:   "help [command]",
-			Short: "Help about any command",
-			Long: `Help provides help for any command in the application.
-Simply type ` + c.DisplayName() + ` help [path to command] for full details.`,
-			ValidArgsFunction: func(c *Command, args []string, toComplete string) ([]Completion, ShellCompDirective) {
-				var completions []Completion
-				cmd, _, e := c.Root().Find(args)
-				if e != nil {
-					return nil, ShellCompDirectiveNoFileComp
-				}
-				if cmd == nil {
-					// Root help command.
-					cmd = c.Root()
-				}
-				for _, subCmd := range cmd.Commands() {
-					if subCmd.IsAvailableCommand() || subCmd == cmd.helpCommand {
-						if strings.HasPrefix(subCmd.Name(), toComplete) {
-							completions = append(completions, CompletionWithDesc(subCmd.Name(), subCmd.Short))
-						}
-					}
-				}
-				return completions, ShellCompDirectiveNoFileComp
-			},
-			Run: func(c *Command, args []string) {
-				cmd, _, e := c.Root().Find(args)
-				if cmd == nil || e != nil {
-					c.Printf("Unknown help topic %#q\n", args)
-					CheckErr(c.Root().Usage())
-				} else {
-					// FLow the context down to be used in help text
-					if cmd.ctx == nil {
-						cmd.ctx = c.ctx
-					}
+		c.helpCommand = newDefaultHelpCmd(c)
+	}
 
-					cmd.InitDefaultHelpFlag()    // make possible 'help' flag to be shown
-					cmd.InitDefaultVersionFlag() // make possible 'version' flag to be shown
-					CheckErr(cmd.Help())
-				}
-			},
-			GroupID: c.helpCommandGroupID,
+	for _, sub := range c.commands {
+		if sub == c.helpCommand {
+			// Already registered: keep the tree stable across repeated runs
+			// instead of detaching and re-attaching the command on every
+			// Execute.
+			return
 		}
 	}
-	c.RemoveCommand(c.helpCommand)
 	c.AddCommand(c.helpCommand)
+}
+
+// InitDefaultCommands explicitly assembles the built-in commands that belong
+// to the tree: the default 'help' command, the hidden '__complete' request
+// command and the default 'completion' command.
+//
+// It is normally called automatically by ExecuteC, but can also be invoked
+// ahead of time, for example in tests that need a complete, fully wired tree
+// without running the root command. The registration is idempotent: calling it
+// repeatedly never rebuilds or re-attaches the same built-in commands, so the
+// resulting tree is stable. The individual InitDefault* functions stay
+// available for more fine-grained control.
+func (c *Command) InitDefaultCommands(args ...string) {
+	c.InitDefaultHelpCmd()
+	c.initCompleteCmd(args)
+	c.InitDefaultCompletionCmd(args...)
+}
+
+// newDefaultHelpCmd builds the default 'help' command without attaching it to
+// the tree. Keeping construction separate from registration makes the command
+// tree explicit and reproducible: callers can inspect or replace the built
+// command before it gets registered through InitDefaultHelpCmd.
+func newDefaultHelpCmd(root *Command) *Command {
+	return &Command{
+		Use:   "help [command]",
+		Short: "Help about any command",
+		Long: `Help provides help for any command in the application.
+Simply type ` + root.DisplayName() + ` help [path to command] for full details.`,
+		ValidArgsFunction: func(c *Command, args []string, toComplete string) ([]Completion, ShellCompDirective) {
+			var completions []Completion
+			cmd, _, e := c.Root().Find(args)
+			if e != nil {
+				return nil, ShellCompDirectiveNoFileComp
+			}
+			if cmd == nil {
+				// Root help command.
+				cmd = c.Root()
+			}
+			for _, subCmd := range cmd.Commands() {
+				if subCmd.IsAvailableCommand() || subCmd == cmd.helpCommand {
+					if strings.HasPrefix(subCmd.Name(), toComplete) {
+						completions = append(completions, CompletionWithDesc(subCmd.Name(), subCmd.Short))
+					}
+				}
+			}
+			return completions, ShellCompDirectiveNoFileComp
+		},
+		Run: func(c *Command, args []string) {
+			cmd, _, e := c.Root().Find(args)
+			if cmd == nil || e != nil {
+				c.Printf("Unknown help topic %#q\n", args)
+				CheckErr(c.Root().Usage())
+			} else {
+				// FLow the context down to be used in help text
+				if cmd.ctx == nil {
+					cmd.ctx = c.ctx
+				}
+
+				cmd.InitDefaultHelpFlag()    // make possible 'help' flag to be shown
+				cmd.InitDefaultVersionFlag() // make possible 'version' flag to be shown
+				CheckErr(cmd.Help())
+			}
+		},
+		GroupID: root.helpCommandGroupID,
+	}
 }
 
 // ResetCommands delete parent, subcommand and help command from c.
@@ -1364,7 +1393,19 @@ func (c *Command) AddCommand(cmds ...*Command) {
 		}
 		c.commands = append(c.commands, x)
 		c.commandsAreSorted = false
+		// Derived flag views depend on the parent chain; they must be
+		// recomputed against the new parent instead of serving stale entries.
+		x.invalidateFlagViews()
 	}
+}
+
+// invalidateFlagViews drops the flag views derived from the command's
+// position in the tree (parent persistent flags, local and inherited flags).
+// The command's own local and persistent flag declarations are untouched.
+func (c *Command) invalidateFlagViews() {
+	c.lflags = nil
+	c.iflags = nil
+	c.parentsPflags = nil
 }
 
 // Groups returns a slice of child command groups.
@@ -1405,6 +1446,7 @@ main:
 		for _, cmd := range cmds {
 			if command == cmd {
 				command.parent = nil
+				command.invalidateFlagViews()
 				continue main
 			}
 		}
@@ -1736,6 +1778,16 @@ func (c *Command) LocalFlags() *flag.FlagSet {
 	}
 	c.Flags().VisitAll(addToLocal)
 	c.PersistentFlags().VisitAll(addToLocal)
+	if c.parent == nil {
+		// Historically flags declared on pflag.CommandLine are merged into the
+		// root itself, so they are shown as local flags of the root rather
+		// than as inherited flags.
+		c.globalFlags().VisitAll(func(f *flag.Flag) {
+			if c.lflags.Lookup(f.Name) == nil {
+				c.lflags.AddFlag(f)
+			}
+		})
+	}
 	return c.lflags
 }
 
@@ -1758,7 +1810,8 @@ func (c *Command) InheritedFlags() *flag.FlagSet {
 	}
 
 	c.parentsPflags.VisitAll(func(f *flag.Flag) {
-		if c.iflags.Lookup(f.Name) == nil && local.Lookup(f.Name) == nil {
+		isGlobal := c.parent == nil && c.globalFlags().Lookup(f.Name) == f
+		if !isGlobal && c.iflags.Lookup(f.Name) == nil && local.Lookup(f.Name) == nil {
 			c.iflags.AddFlag(f)
 		}
 	})
@@ -1893,8 +1946,31 @@ func (c *Command) Parent() *Command {
 	return c.parent
 }
 
+// globalFlags returns the flags declared on the process-wide flag.CommandLine.
+//
+// These flags are an implicit, read-only bottom layer shared by every command
+// tree; they must never be copied into any command's own PersistentFlags set.
+func (c *Command) globalFlags() *flag.FlagSet {
+	return flag.CommandLine
+}
+
 // mergePersistentFlags merges c.PersistentFlags() to c.Flags()
 // and adds missing persistent flags of all parents.
+//
+// The merge order defines which flag wins when the same name is declared on
+// several layers: flags already present in c.Flags() (local flags and cobra's
+// own help/version flags) are never replaced, then this command's persistent
+// flags are added, then the persistent flags of the nearest parents. Because
+// pflag's AddFlagSet keeps the first occurrence, the effective precedence is:
+//
+//	local (non-persistent) flags on c
+//	> persistent flags declared on c
+//	> persistent flags of the nearest parent
+//	> ...
+//	> persistent flags of the root
+//	> flags from pflag.CommandLine
+//
+// In short: the declaration closest to the executed command wins.
 func (c *Command) mergePersistentFlags() {
 	c.updateParentsPflags()
 	c.Flags().AddFlagSet(c.PersistentFlags())
@@ -1915,11 +1991,16 @@ func (c *Command) updateParentsPflags() {
 		c.parentsPflags.SetNormalizeFunc(c.globNormFunc)
 	}
 
-	c.Root().PersistentFlags().AddFlagSet(flag.CommandLine)
-
 	c.VisitParents(func(parent *Command) {
 		c.parentsPflags.AddFlagSet(parent.PersistentFlags())
 	})
+
+	// Flags declared on pflag.CommandLine form the shared bottom layer for
+	// every command. They are added to the derived, per-command view only and
+	// are never copied into any command's own PersistentFlags set, so a child
+	// merely accessing its flags can never mutate its parent's persistent
+	// collection.
+	c.parentsPflags.AddFlagSet(c.globalFlags())
 }
 
 // commandNameMatches checks if two command names are equal

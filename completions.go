@@ -229,7 +229,35 @@ func (d ShellCompDirective) string() string {
 
 // initCompleteCmd adds a special hidden command that can be used to request custom completions.
 func (c *Command) initCompleteCmd(args []string) {
-	completeCmd := &Command{
+	completeCmd := newCompleteCmd()
+	for _, sub := range c.commands {
+		if sub.Name() == ShellCompRequestCmd || sub.HasAlias(ShellCompNoDescRequestCmd) {
+			// A completion request command is already registered; reuse it and
+			// keep the tree stable instead of attaching a second one.
+			completeCmd = sub
+			break
+		}
+	}
+	if completeCmd.parent != c {
+		c.AddCommand(completeCmd)
+	}
+
+	subCmd, _, err := c.Find(args)
+	if err != nil || subCmd.Name() != ShellCompRequestCmd {
+		// Only create this special command if it is actually being called.
+		// This reduces possible side-effects of creating such a command;
+		// for example, having this command would cause problems to a
+		// cobra program that only consists of the root command, since this
+		// command would cause the root command to suddenly have a subcommand.
+		c.RemoveCommand(completeCmd)
+	}
+}
+
+// newCompleteCmd builds the hidden shell-completion request command without
+// attaching it to any tree. Construction is kept separate from registration so
+// callers can assemble a complete, explicit command tree for testing.
+func newCompleteCmd() *Command {
+	return &Command{
 		Use:                   fmt.Sprintf("%s [command-line]", ShellCompRequestCmd),
 		Aliases:               []string{ShellCompNoDescRequestCmd},
 		DisableFlagsInUseLine: true,
@@ -292,16 +320,6 @@ func (c *Command) initCompleteCmd(args []string) {
 			// Output from stderr must be ignored by the completion script.
 			fmt.Fprintf(finalCmd.ErrOrStderr(), "Completion ended with directive: %s\n", directive.string())
 		},
-	}
-	c.AddCommand(completeCmd)
-	subCmd, _, err := c.Find(args)
-	if err != nil || subCmd.Name() != ShellCompRequestCmd {
-		// Only create this special command if it is actually being called.
-		// This reduces possible side-effects of creating such a command;
-		// for example, having this command would cause problems to a
-		// cobra program that only consists of the root command, since this
-		// command would cause the root command to suddenly have a subcommand.
-		c.RemoveCommand(completeCmd)
 	}
 }
 
@@ -757,8 +775,6 @@ func (c *Command) InitDefaultCompletionCmd(args ...string) {
 		}
 	}
 
-	haveNoDescFlag := !c.CompletionOptions.DisableNoDescFlag && !c.CompletionOptions.DisableDescriptions
-
 	// Special case to know if there are sub-commands or not.
 	hasSubCommands := false
 	for _, cmd := range c.commands {
@@ -769,17 +785,7 @@ func (c *Command) InitDefaultCompletionCmd(args ...string) {
 		}
 	}
 
-	completionCmd := &Command{
-		Use:   compCmdName,
-		Short: "Generate the autocompletion script for the specified shell",
-		Long: fmt.Sprintf(`Generate the autocompletion script for %[1]s for the specified shell.
-See each sub-command's help for details on how to use the generated script.
-`, c.Root().Name()),
-		Args:              NoArgs,
-		ValidArgsFunction: NoFileCompletions,
-		Hidden:            c.CompletionOptions.HiddenDefaultCmd,
-		GroupID:           c.completionCommandGroupID,
-	}
+	completionCmd := newDefaultCompletionCmd(c)
 	c.AddCommand(completionCmd)
 
 	if !hasSubCommands {
@@ -797,6 +803,32 @@ See each sub-command's help for details on how to use the generated script.
 			return
 		}
 	}
+}
+
+// newDefaultCompletionCmd builds the default 'completion' command together
+// with its bash/zsh/fish/powershell subcommands, without registering it on c.
+// Construction is separate from registration so a command tree can be
+// assembled explicitly and deterministically in tests.
+func newDefaultCompletionCmd(c *Command) *Command {
+	completionCmd := &Command{
+		Use:   compCmdName,
+		Short: "Generate the autocompletion script for the specified shell",
+		Long: fmt.Sprintf(`Generate the autocompletion script for %[1]s for the specified shell.
+See each sub-command's help for details on how to use the generated script.
+`, c.Root().Name()),
+		Args:              NoArgs,
+		ValidArgsFunction: NoFileCompletions,
+		Hidden:            c.CompletionOptions.HiddenDefaultCmd,
+		GroupID:           c.completionCommandGroupID,
+	}
+	addCompletionShellCmds(c, completionCmd)
+	return completionCmd
+}
+
+// addCompletionShellCmds attaches the bash, zsh, fish and powershell
+// subcommands to completionCmd.
+func addCompletionShellCmds(c *Command, completionCmd *Command) {
+	haveNoDescFlag := !c.CompletionOptions.DisableNoDescFlag && !c.CompletionOptions.DisableDescriptions
 
 	out := c.OutOrStdout()
 	noDesc := c.CompletionOptions.DisableDescriptions
