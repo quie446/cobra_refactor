@@ -1339,6 +1339,12 @@ func (c *Command) Commands() []*Command {
 }
 
 // AddCommand adds one or more commands to this parent command.
+//
+// AddCommand only links the commands into the tree: it sets each child's
+// parent pointer and records the child in c's command list. It does not
+// create, merge, or modify any flag set of c or of the added commands, so
+// commands can be assembled in any order and flag resolution stays a
+// read-time operation over the finished tree.
 func (c *Command) AddCommand(cmds ...*Command) {
 	for i, x := range cmds {
 		if cmds[i] == c {
@@ -1713,6 +1719,11 @@ func (c *Command) LocalNonPersistentFlags() *flag.FlagSet {
 
 // LocalFlags returns the local FlagSet specifically set in the current command.
 // This function does not modify the flags of the current command, it's purpose is to return the current state.
+//
+// A flag is local when it was declared on this command itself, either on
+// c.Flags() or on c.PersistentFlags(). A local flag always shadows a
+// same-named flag inherited from a parent command; see mergePersistentFlags
+// for the full precedence rules.
 func (c *Command) LocalFlags() *flag.FlagSet {
 	c.mergePersistentFlags()
 
@@ -1741,6 +1752,10 @@ func (c *Command) LocalFlags() *flag.FlagSet {
 
 // InheritedFlags returns all flags which were inherited from parent commands.
 // This function does not modify the flags of the current command, it's purpose is to return the current state.
+//
+// Inherited flags are the persistent flags of the command's parents (and the
+// process-wide pflag.CommandLine set). An inherited flag whose name is
+// shadowed by a local flag of this command is not reported here.
 func (c *Command) InheritedFlags() *flag.FlagSet {
 	c.mergePersistentFlags()
 
@@ -1893,17 +1908,43 @@ func (c *Command) Parent() *Command {
 	return c.parent
 }
 
-// mergePersistentFlags merges c.PersistentFlags() to c.Flags()
-// and adds missing persistent flags of all parents.
+// mergePersistentFlags resolves the flag sets a command reads flags from
+// into c.Flags(), in a fixed order:
+//
+//  1. the command's own persistent flags (c.PersistentFlags())
+//  2. the persistent flags inherited from its parents, nearest parent first
+//     (c.parentsPflags)
+//  3. the process-wide pflag.CommandLine set
+//
+// pflag's AddFlagSet keeps the first flag registered under a given name, and
+// any flags declared directly on c.Flags() precede all of the above, so the
+// effective precedence for same-named flags is:
+//
+//	local flags > own persistent flags > nearest parent's persistent flags >
+//	... > root's persistent flags > pflag.CommandLine
+//
+// mergePersistentFlags only writes to c's own flag sets; it never modifies
+// the flag sets of any other command in the tree.
 func (c *Command) mergePersistentFlags() {
 	c.updateParentsPflags()
 	c.Flags().AddFlagSet(c.PersistentFlags())
 	c.Flags().AddFlagSet(c.parentsPflags)
+	if !c.HasParent() {
+		// The root command has no parents to inherit the process-wide
+		// CommandLine set from, so merge it directly into its own full
+		// flag set instead of into its persistent flag set. This keeps
+		// pflag.CommandLine flags visible to the root command without
+		// polluting the persistent flags it hands down to its children.
+		c.Flags().AddFlagSet(flag.CommandLine)
+	}
 }
 
 // updateParentsPflags updates c.parentsPflags by adding
 // new persistent flags of all parents.
 // If c.parentsPflags == nil, it makes new.
+//
+// updateParentsPflags only writes to c's own parentsPflags; it never
+// modifies the flag sets of any parent command.
 func (c *Command) updateParentsPflags() {
 	if c.parentsPflags == nil {
 		c.parentsPflags = flag.NewFlagSet(c.DisplayName(), flag.ContinueOnError)
@@ -1915,11 +1956,19 @@ func (c *Command) updateParentsPflags() {
 		c.parentsPflags.SetNormalizeFunc(c.globNormFunc)
 	}
 
-	c.Root().PersistentFlags().AddFlagSet(flag.CommandLine)
-
 	c.VisitParents(func(parent *Command) {
 		c.parentsPflags.AddFlagSet(parent.PersistentFlags())
 	})
+
+	if c.HasParent() {
+		// Flags registered on the process-wide pflag.CommandLine set are
+		// treated as inherited from the process environment, like the
+		// persistent flags of a parent command. They are merged into c's
+		// own inherited set rather than into the root command's persistent
+		// flag set, so that resolving flags for one command never mutates
+		// another command's flag sets.
+		c.parentsPflags.AddFlagSet(flag.CommandLine)
+	}
 }
 
 // commandNameMatches checks if two command names are equal
